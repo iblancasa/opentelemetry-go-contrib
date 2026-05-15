@@ -5,12 +5,15 @@ package ecs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 
 	metadata "github.com/brunoscheufler/aws-ecs-metadata-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
@@ -39,6 +42,19 @@ func (detectorUtils *MockDetectorUtils) getContainerMetadataV4(context.Context) 
 func (detectorUtils *MockDetectorUtils) getTaskMetadataV4(context.Context) (*metadata.TaskMetadataV4, error) {
 	args := detectorUtils.Called()
 	return args.Get(0).(*metadata.TaskMetadataV4), args.Error(1)
+}
+
+func TestNewResourceDetector(t *testing.T) {
+	oldNewDetectorUtils := newDetectorUtils
+	t.Cleanup(func() {
+		newDetectorUtils = oldNewDetectorUtils
+	})
+
+	utils := new(MockDetectorUtils)
+	newDetectorUtils = func() detectorUtils { return utils }
+
+	detector := NewResourceDetector()
+	assert.Same(t, utils, detector.(*resourceDetector).utils)
 }
 
 // successfully returns resource when process is running on Amazon ECS environment
@@ -259,4 +275,86 @@ func TestCgroupContainerID(t *testing.T) {
 			assert.Equal(t, c.wantContainerID, containerID)
 		})
 	}
+}
+
+func TestECSDetectorUtilsInjection(t *testing.T) {
+	t.Run("getContainerMetadataV4 uses injectable function", func(t *testing.T) {
+		oldGetContainerMetadataV4 := getContainerMetadataV4
+		t.Cleanup(func() {
+			getContainerMetadataV4 = oldGetContainerMetadataV4
+		})
+
+		expected := &metadata.ContainerMetadataV4{ContainerARN: "arn:aws:ecs:us-west-2:111122223333:container/test"}
+		getContainerMetadataV4 = func(_ context.Context, client *http.Client) (*metadata.ContainerMetadataV4, error) {
+			assert.NotNil(t, client)
+			return expected, nil
+		}
+
+		got, err := (ecsDetectorUtils{}).getContainerMetadataV4(t.Context())
+		require.NoError(t, err)
+		assert.Same(t, expected, got)
+	})
+
+	t.Run("getTaskMetadataV4 uses injectable function", func(t *testing.T) {
+		oldGetTaskMetadataV4 := getTaskMetadataV4
+		t.Cleanup(func() {
+			getTaskMetadataV4 = oldGetTaskMetadataV4
+		})
+
+		expected := &metadata.TaskMetadataV4{TaskARN: "arn:aws:ecs:us-west-2:111122223333:task/default/taskid"}
+		getTaskMetadataV4 = func(_ context.Context, client *http.Client) (*metadata.TaskMetadataV4, error) {
+			assert.NotNil(t, client)
+			return expected, nil
+		}
+
+		got, err := (ecsDetectorUtils{}).getTaskMetadataV4(t.Context())
+		require.NoError(t, err)
+		assert.Same(t, expected, got)
+	})
+
+	t.Run("getContainerID uses injected readFile on linux", func(t *testing.T) {
+		utils := ecsDetectorUtils{
+			readFile: func(string) ([]byte, error) {
+				return []byte("10:memory:/ecs/my-task-name/1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"), nil
+			},
+			goos: "linux",
+		}
+
+		got, err := utils.getContainerID()
+		require.NoError(t, err)
+		assert.Equal(t, "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", got)
+	})
+
+	t.Run("getContainerID returns empty on non-linux", func(t *testing.T) {
+		utils := ecsDetectorUtils{
+			goos: "darwin",
+		}
+
+		got, err := utils.getContainerID()
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("getContainerName uses injected hostname", func(t *testing.T) {
+		utils := ecsDetectorUtils{
+			hostname: func() (string, error) {
+				return "test-host", nil
+			},
+		}
+
+		got, err := utils.getContainerName()
+		require.NoError(t, err)
+		assert.Equal(t, "test-host", got)
+	})
+
+	t.Run("getContainerName maps hostname error", func(t *testing.T) {
+		utils := ecsDetectorUtils{
+			hostname: func() (string, error) {
+				return "", errors.New("boom")
+			},
+		}
+
+		_, err := utils.getContainerName()
+		assert.ErrorIs(t, err, errCannotReadContainerName)
+	})
 }

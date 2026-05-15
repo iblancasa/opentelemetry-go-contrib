@@ -36,6 +36,15 @@ var (
 	errCannotRetrieveLogsGroupMetadataV4  = errors.New("the ECS Metadata v4 did not return a AwsLogGroup name")
 	errCannotRetrieveLogsStreamMetadataV4 = errors.New("the ECS Metadata v4 did not return a AwsLogStream name")
 	ecsCgroupPathPattern                  = regexp.MustCompile(`/ecs/[^/]+/[a-f0-9]{64}$`)
+	newDetectorUtils                      = func() detectorUtils {
+		return ecsDetectorUtils{
+			readFile: os.ReadFile,
+			hostname: os.Hostname,
+			goos:     runtime.GOOS,
+		}
+	}
+	getContainerMetadataV4 = ecsmetadata.GetContainerV4
+	getTaskMetadataV4      = ecsmetadata.GetTaskV4
 )
 
 // Create interface for methods needing to be mocked.
@@ -46,8 +55,17 @@ type detectorUtils interface {
 	getTaskMetadataV4(ctx context.Context) (*ecsmetadata.TaskMetadataV4, error)
 }
 
+type (
+	readFileFunc func(string) ([]byte, error)
+	hostnameFunc func() (string, error)
+)
+
 // struct implements detectorUtils interface.
-type ecsDetectorUtils struct{}
+type ecsDetectorUtils struct {
+	readFile readFileFunc
+	hostname hostnameFunc
+	goos     string
+}
 
 // resource detector collects resource information from Elastic Container Service environment.
 type resourceDetector struct {
@@ -63,7 +81,7 @@ var _ resource.Detector = (*resourceDetector)(nil)
 // NewResourceDetector returns a resource detector that will detect AWS ECS resources.
 func NewResourceDetector() resource.Detector {
 	return &resourceDetector{
-		utils: ecsDetectorUtils{},
+		utils: newDetectorUtils(),
 	}
 }
 
@@ -226,22 +244,22 @@ func (*resourceDetector) getLogsAttributes(metadata *ecsmetadata.ContainerMetada
 
 // returns metadata v4 for the container.
 func (ecsDetectorUtils) getContainerMetadataV4(ctx context.Context) (*ecsmetadata.ContainerMetadataV4, error) {
-	return ecsmetadata.GetContainerV4(ctx, &http.Client{})
+	return getContainerMetadataV4(ctx, &http.Client{})
 }
 
 // returns metadata v4 for the task.
 func (ecsDetectorUtils) getTaskMetadataV4(ctx context.Context) (*ecsmetadata.TaskMetadataV4, error) {
-	return ecsmetadata.GetTaskV4(ctx, &http.Client{})
+	return getTaskMetadataV4(ctx, &http.Client{})
 }
 
 // returns docker container ID from default c group path.
-func (ecsDetectorUtils) getContainerID() (string, error) {
-	if runtime.GOOS != "linux" {
+func (d ecsDetectorUtils) getContainerID() (string, error) {
+	if d.goos != "linux" {
 		// Cgroups are used only under Linux.
 		return "", nil
 	}
 
-	fileData, err := os.ReadFile(defaultCgroupPath)
+	fileData, err := d.readFile(defaultCgroupPath)
 	if err != nil {
 		// Cgroups file not found.
 		// For example, windows; or when running integration tests outside of a container.
@@ -251,8 +269,8 @@ func (ecsDetectorUtils) getContainerID() (string, error) {
 }
 
 // returns host name reported by the kernel.
-func (ecsDetectorUtils) getContainerName() (string, error) {
-	hostName, err := os.Hostname()
+func (d ecsDetectorUtils) getContainerName() (string, error) {
+	hostName, err := d.hostname()
 	if err != nil {
 		return "", errCannotReadContainerName
 	}
